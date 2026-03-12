@@ -203,18 +203,55 @@ def paginate_corpus(corpus_path):
 
 
 def render_chunk_html(pages, start_page_num):
-    """Render a list of pages as HTML fragment (no <html>/<body> wrapper)."""
+    """Render a list of pages as HTML fragment (no <html>/<body> wrapper).
+
+    Lines inside $$...$$ or $...$ math delimiters are NOT html-escaped,
+    since html.escape() turns < into &lt; which breaks KaTeX parsing.
+    Non-math lines are escaped normally for safety.
+    """
     parts = []
+    in_display_math = False
     for i, page in enumerate(pages):
         pnum = start_page_num + i
         parts.append(f'<div class="page" id="p{pnum}">')
         parts.append(f'<div class="page-num">p. {pnum}</div>')
         parts.append('<pre>')
         for line in page:
-            parts.append(html.escape(line))
+            stripped = line.strip()
+            # Track multi-line $$...$$ blocks
+            if stripped.startswith('$$') and not stripped.endswith('$$'):
+                in_display_math = True
+                parts.append(line)
+            elif stripped.endswith('$$') and in_display_math:
+                in_display_math = False
+                parts.append(line)
+            elif in_display_math:
+                parts.append(line)
+            elif '$' in line:
+                # Line has inline math — escape only non-math parts
+                parts.append(_escape_around_math(line))
+            else:
+                parts.append(html.escape(line))
         parts.append('</pre>')
         parts.append('</div>')
     return '\n'.join(parts)
+
+
+def _escape_around_math(line):
+    """HTML-escape a line while preserving $...$ and $$...$$ content."""
+    import re
+    result = []
+    pos = 0
+    # Match $$...$$ first, then $...$
+    for m in re.finditer(r'\$\$.*?\$\$|\$[^$\n]+?\$', line):
+        # Escape text before the match
+        result.append(html.escape(line[pos:m.start()]))
+        # Keep math unescaped
+        result.append(m.group())
+        pos = m.end()
+    # Escape remaining text
+    result.append(html.escape(line[pos:]))
+    return ''.join(result)
 
 
 def encrypt_blob(data_bytes, passphrase):
@@ -364,7 +401,8 @@ def write_loader_html(output_dir, total_pages, manifest):
 <style>{DARK_CSS}
 .page {{ margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }}
 .page-num {{ font-size: .7rem; color: var(--fg2); text-align: right; }}
-pre {{ margin: 0; white-space: pre-wrap; word-wrap: break-word; font-size: 12px; }}
+pre {{ margin: 0; white-space: pre-wrap; word-wrap: break-word;
+  font-size: clamp(10px, 1.3vw, 14px); }}
 :target {{ background: var(--highlight); }}
 #unlock {{ max-width: 400px; margin: 4rem auto; text-align: center; }}
 #unlock input {{ font-family: monospace; padding: .5rem; width: 80%;
@@ -386,8 +424,9 @@ pre {{ margin: 0; white-space: pre-wrap; word-wrap: break-word; font-size: 12px;
 </head>
 <body>
 {TOGGLE_BTN}
-<h1>Corpus</h1>
-<p style="font-size:.8rem;color:var(--fg2)">{total_pages:,} pages (A4 simulation, 12pt monospace, {LINES_PER_PAGE} lines/page)</p>
+<p style="font-size:.8rem;margin-bottom:.5rem"><a href="../">&larr; Back to index</a></p>
+<h1 style="text-align:center">Corpus</h1>
+<p style="font-size:.8rem;color:var(--fg2);text-align:center">{total_pages:,} pages (A4 simulation, 12pt monospace, {LINES_PER_PAGE} lines/page)</p>
 
 <div id="unlock">
   <p style="font-size:.85rem;color:var(--fg2)">This corpus is encrypted and GPG-signed. Enter the passphrase to view.</p>
