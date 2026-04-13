@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+from sitever import version_tag
 
 LINES_PER_PAGE = 41
 CHARS_PER_LINE = 62
@@ -163,14 +164,57 @@ function addLatexDelimiters(html) {
 """
 
 
-def wrap_line(line, chars_per_line):
+def _find_safe_break(line, limit):
+    """Find a break point at or before limit that doesn't split $...$ math."""
+    # Find best space break point
+    brk = line.rfind(' ', 0, limit + 1)
+    if brk <= 0:
+        brk = limit
+
+    # Check if breaking here splits a $...$ block.
+    # Count unescaped $ signs before the break point.
+    # Odd count means we're inside inline math — push break past the closing $.
+    prefix = line[:brk]
+    dollar_count = 0
+    i = 0
+    while i < len(prefix):
+        if prefix[i] == '$':
+            dollar_count += 1
+        elif prefix[i] == '\\' and i + 1 < len(prefix):
+            i += 1  # skip escaped char
+        i += 1
+
+    if dollar_count % 2 == 1:
+        # Inside inline math — find the closing $ and break after it
+        close = line.find('$', brk)
+        if close >= 0:
+            # Break after the closing $ (find next space after it)
+            next_space = line.find(' ', close + 1)
+            if next_space >= 0:
+                return next_space
+            return len(line)  # no space — don't break this line
+        # No closing $ found — break at the original point (malformed math)
+    return brk
+
+
+def wrap_line(line, chars_per_line, in_display_math=False):
     if not line:
         return ['']
+    stripped = line.strip()
+    # Never wrap lines inside display math ($$, \[...\], \begin)
+    if in_display_math:
+        return [line]
+    if stripped.startswith('$$') or stripped.endswith('$$'):
+        return [line]
+    if stripped.startswith('\\begin{') or stripped.startswith('\\end{'):
+        return [line]
+    if stripped == '\\[' or stripped == '\\]':
+        return [line]
     segments = []
     while len(line) > chars_per_line:
-        brk = line.rfind(' ', 0, chars_per_line + 1)
-        if brk <= 0:
-            brk = chars_per_line
+        brk = _find_safe_break(line, chars_per_line)
+        if brk >= len(line):
+            break  # can't break safely — keep whole line
         segments.append(line[:brk])
         line = line[brk:].lstrip(' ')
     if line:
@@ -185,10 +229,25 @@ def paginate_corpus(corpus_path):
     pages = []
     current_page = []
     page_num = 1
+    in_display_math = False
 
     for idx, line in enumerate(raw_lines):
         line_text = line.rstrip('\n')
-        segments = wrap_line(line_text, CHARS_PER_LINE)
+        stripped = line_text.strip()
+
+        # Track \[...\] display math blocks
+        if stripped == '\\[':
+            in_display_math = True
+        elif stripped == '\\]':
+            in_display_math = False
+
+        # Track $$...$$ multi-line blocks (opening $$ without closing on same line)
+        if stripped.startswith('$$') and not stripped.endswith('$$'):
+            in_display_math = True
+        elif stripped.endswith('$$') and in_display_math:
+            in_display_math = False
+
+        segments = wrap_line(line_text, CHARS_PER_LINE, in_display_math)
         for segment in segments:
             current_page.append(segment)
             if len(current_page) >= LINES_PER_PAGE:
@@ -218,16 +277,16 @@ def render_chunk_html(pages, start_page_num):
         parts.append('<pre>')
         for line in page:
             stripped = line.strip()
-            # Track multi-line $$...$$ blocks
-            if stripped.startswith('$$') and not stripped.endswith('$$'):
+            # Track multi-line display math: $$...$$ and \[...\]
+            if stripped == '\\[' or (stripped.startswith('$$') and not stripped.endswith('$$')):
                 in_display_math = True
                 parts.append(line)
-            elif stripped.endswith('$$') and in_display_math:
+            elif (stripped == '\\]' or stripped.endswith('$$')) and in_display_math:
                 in_display_math = False
                 parts.append(line)
             elif in_display_math:
                 parts.append(line)
-            elif '$' in line:
+            elif '$' in line or '\\(' in line or '\\)' in line:
                 # Line has inline math — escape only non-math parts
                 parts.append(_escape_around_math(line))
             else:
@@ -238,18 +297,15 @@ def render_chunk_html(pages, start_page_num):
 
 
 def _escape_around_math(line):
-    """HTML-escape a line while preserving $...$ and $$...$$ content."""
+    """HTML-escape a line while preserving math delimiters unescaped."""
     import re
     result = []
     pos = 0
-    # Match $$...$$ first, then $...$
-    for m in re.finditer(r'\$\$.*?\$\$|\$[^$\n]+?\$', line):
-        # Escape text before the match
+    # Match $$...$$, $...$, \(...\) — order matters (longest first)
+    for m in re.finditer(r'\$\$.*?\$\$|\$[^$\n]+?\$|\\\(.*?\\\)', line):
         result.append(html.escape(line[pos:m.start()]))
-        # Keep math unescaped
         result.append(m.group())
         pos = m.end()
-    # Escape remaining text
     result.append(html.escape(line[pos:]))
     return ''.join(result)
 
@@ -392,10 +448,12 @@ def write_loader_html(output_dir, total_pages, manifest):
     manifest_json = json.dumps(manifest)
 
     with open(loader_path, 'w') as f:
+        vtag = version_tag(__file__)
         f.write(f'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+{vtag}
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Corpus</title>
 <style>{DARK_CSS}
@@ -415,6 +473,18 @@ pre {{ margin: 0; white-space: pre-wrap; word-wrap: break-word;
 .blob-loading {{ text-align: center; padding: 2rem; color: var(--fg2); font-size: .8rem; }}
 .katex {{ font-size: 1em; }}
 .katex-display {{ overflow-x: auto; margin: .25em 0; }}
+#nav {{ position: sticky; top: 0; z-index: 999; background: var(--bg);
+  border-bottom: 1px solid var(--border); padding: .4rem .5rem;
+  display: none; align-items: center; gap: .5rem; flex-wrap: wrap;
+  font-size: .75rem; color: var(--fg2); }}
+#nav button {{ background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 4px; padding: .2rem .6rem; color: var(--fg);
+  cursor: pointer; font-family: monospace; font-size: .75rem; }}
+#nav button:disabled {{ opacity: .3; cursor: default; }}
+#nav input[type=number] {{ width: 5em; font-family: monospace; padding: .2rem .3rem;
+  background: var(--bg2); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 4px; font-size: .75rem; }}
+#nav input[type=number]::-webkit-inner-spin-button {{ -webkit-appearance: none; }}
 </style>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
   onerror="document.documentElement.dataset.nokatex='1'">
@@ -437,20 +507,22 @@ pre {{ margin: 0; white-space: pre-wrap; word-wrap: break-word;
   <div id="status"></div>
 </div>
 
+<div id="nav">
+  <button id="prev-btn" onclick="navBlob(curBlob-1)">&larr; Prev</button>
+  <span id="nav-info"></span>
+  <button id="next-btn" onclick="navBlob(curBlob+1)">Next &rarr;</button>
+  <span>|</span>
+  <label>Page <input type="number" id="goto-page" min="1" onkeydown="if(event.key==='Enter')gotoPage(+this.value)"></label>
+  <button onclick="gotoPage(+document.getElementById('goto-page').value)">Go</button>
+</div>
 <div id="corpus" style="display:none"></div>
 
 <script>
 const MANIFEST = {manifest_json};
 const ITERATIONS = {PBKDF2_ITERATIONS};
-const SCROLL_SETTLE = 200;
-const WINDOW = 1; // current +/- 1 = 3 blobs max
-
 const keyCache = new Map();
 const blobHTML = new Map();
-const blobHeights = new Map();
-const loaded = new Set();
-const loading = new Set();
-let scrollTimer = null;
+let curBlob = -1;
 
 {LATEX_PREPROCESS_JS}
 // KaTeX rendering — safe fallback: if CDN fails or parse errors, raw text stays
@@ -533,113 +605,76 @@ async function decryptBlob(encrypted, passphrase) {{
   return new TextDecoder().decode(result);
 }}
 
-// 3. Precomputed heights — all blobs same page count = same estimated height
-// Each page: ~41 lines * 16.8px + overhead ≈ 740px
-const EST_PAGE_H = 740;
-function estHeight(blob) {{
-  return blobHeights.get(blob.id) || (blob.endPage - blob.startPage + 1) * EST_PAGE_H;
+// --- Blob paging: one blob at a time, no giant scroll height ---
+function updateNav() {{
+  const blob = MANIFEST[curBlob];
+  document.getElementById('nav-info').textContent =
+    'Pages ' + blob.startPage + '\\u2013' + blob.endPage + '  (' + (curBlob + 1) + '/' + MANIFEST.length + ')';
+  document.getElementById('prev-btn').disabled = curBlob === 0;
+  document.getElementById('next-btn').disabled = curBlob === MANIFEST.length - 1;
+  document.getElementById('goto-page').max = MANIFEST[MANIFEST.length - 1].endPage;
 }}
 
-// 3. Scrollbar position → blob index (pure math, no DOM query)
-function blobAtScroll() {{
-  const scrollMid = window.scrollY + window.innerHeight / 2;
-  const corpusTop = document.getElementById('corpus').offsetTop;
-  let cum = corpusTop;
-  for (let i = 0; i < MANIFEST.length; i++) {{
-    cum += estHeight(MANIFEST[i]);
-    if (scrollMid < cum) return i;
-  }}
-  return MANIFEST.length - 1;
-}}
-
-function createPlaceholders() {{
+async function showBlob(idx, scrollToPage) {{
+  if (idx < 0 || idx >= MANIFEST.length) return;
   const corpus = document.getElementById('corpus');
-  corpus.innerHTML = '';
-  for (const blob of MANIFEST) {{
-    const div = document.createElement('div');
-    div.id = 'blob-' + blob.id;
-    div.style.height = estHeight(blob) + 'px';
-    div.style.overflow = 'hidden';
-    div.innerHTML = '<div class="blob-loading">Pages ' + blob.pages + '</div>';
-    corpus.appendChild(div);
-  }}
-}}
+  const blob = MANIFEST[idx];
+  curBlob = idx;
+  updateNav();
 
-// 2 + 5. Load a blob — current + nearest adjacent only (max 3 via window)
-async function loadBlob(blob) {{
-  if (loaded.has(blob.id) || loading.has(blob.id)) return;
-  loading.add(blob.id);
-  const el = document.getElementById('blob-' + blob.id);
-  if (!el) {{ loading.delete(blob.id); return; }}
-
-  // Reuse cached HTML (previously loaded then unloaded)
   if (blobHTML.has(blob.id)) {{
-    el.style.height = 'auto';
-    el.innerHTML = blobHTML.get(blob.id);
-    renderMath(el);
-    blobHeights.set(blob.id, el.offsetHeight);
-    loaded.add(blob.id);
-    loading.delete(blob.id);
-    return;
+    corpus.innerHTML = blobHTML.get(blob.id);
+    renderMath(corpus);
+  }} else {{
+    corpus.innerHTML = '<div class="blob-loading">Loading pages ' + blob.pages + '...</div>';
+    try {{
+      const resp = await fetch(blob.file);
+      const encrypted = new Uint8Array(await resp.arrayBuffer());
+      const passphrase = sessionStorage.getItem('corpus-pass');
+      const html = await decryptBlob(encrypted, passphrase);
+      const sig = blob.sig
+        ? '<div style="text-align:right;font-size:.65rem;margin-top:.5rem">'
+          + '<a href="' + blob.sig + '" style="color:var(--fg2)">GPG signature</a></div>'
+        : '';
+      const full = addLatexDelimiters(html + sig);
+      blobHTML.set(blob.id, full);
+      // Keep cache bounded — evict oldest if > 5
+      if (blobHTML.size > 5) {{
+        const oldest = blobHTML.keys().next().value;
+        if (oldest !== blob.id) blobHTML.delete(oldest);
+      }}
+      corpus.innerHTML = full;
+      renderMath(corpus);
+    }} catch (e) {{
+      corpus.innerHTML = '<div class="blob-loading">Failed to decrypt chunk ' + blob.id + '</div>';
+      console.error('Blob ' + blob.id + ':', e);
+    }}
   }}
 
-  el.innerHTML = '<div class="blob-loading">Loading pages ' + blob.pages + '...</div>';
-  try {{
-    const resp = await fetch(blob.file);
-    const encrypted = new Uint8Array(await resp.arrayBuffer());
-    const passphrase = sessionStorage.getItem('corpus-pass');
-    const html = await decryptBlob(encrypted, passphrase);
-    const sig = blob.sig
-      ? '<div style="text-align:right;font-size:.65rem;margin-top:.5rem">'
-        + '<a href="' + blob.sig + '" style="color:var(--fg2)">GPG signature</a></div>'
-      : '';
-    const full = addLatexDelimiters(html + sig);
-    blobHTML.set(blob.id, full);
-    el.style.height = 'auto';
-    el.innerHTML = full;
-    renderMath(el);
-    blobHeights.set(blob.id, el.offsetHeight);
-    loaded.add(blob.id);
-  }} catch (e) {{
-    el.innerHTML = '<div class="blob-loading">Failed to decrypt chunk ' + blob.id + '</div>';
-    console.error('Blob ' + blob.id + ':', e);
-  }}
-  loading.delete(blob.id);
-}}
-
-// 6. Unload blob — keep height so scrollbar stays stable
-function unloadBlob(blob) {{
-  if (!loaded.has(blob.id)) return;
-  const el = document.getElementById('blob-' + blob.id);
-  if (!el) return;
-  blobHeights.set(blob.id, el.offsetHeight);
-  el.style.height = blobHeights.get(blob.id) + 'px';
-  el.innerHTML = '<div class="blob-loading">Pages ' + blob.pages + '</div>';
-  loaded.delete(blob.id);
-}}
-
-// 5. Rolling window of 3 — load current + adjacent, unload rest
-async function updateWindow() {{
-  const idx = blobAtScroll();
-  const lo = Math.max(0, idx - WINDOW);
-  const hi = Math.min(MANIFEST.length - 1, idx + WINDOW);
-
-  // Unload outside window
-  for (const blob of MANIFEST) {{
-    if (blob.id < lo || blob.id > hi) unloadBlob(blob);
-  }}
-
-  // Load current first, then adjacent
-  await loadBlob(MANIFEST[idx]);
-  for (let i = lo; i <= hi; i++) {{
-    if (i !== idx) loadBlob(MANIFEST[i]);
+  if (scrollToPage) {{
+    setTimeout(function() {{
+      var pg = document.getElementById('p' + scrollToPage);
+      if (pg) pg.scrollIntoView({{ behavior: 'instant' }});
+      else window.scrollTo(0, 0);
+    }}, 30);
+  }} else {{
+    window.scrollTo(0, 0);
   }}
 }}
 
-// 4. Debounced scroll — only load after settling for SCROLL_SETTLE ms
-function onScroll() {{
-  clearTimeout(scrollTimer);
-  scrollTimer = setTimeout(updateWindow, SCROLL_SETTLE);
+function navBlob(idx) {{ showBlob(idx); }}
+
+function gotoPage(p) {{
+  if (!p || p < 1) return;
+  var blob = MANIFEST.find(function(b) {{ return p >= b.startPage && p <= b.endPage; }});
+  if (blob) {{
+    if (blob.id === curBlob) {{
+      var pg = document.getElementById('p' + p);
+      if (pg) pg.scrollIntoView({{ behavior: 'smooth' }});
+    }} else {{
+      showBlob(blob.id, p);
+    }}
+  }}
 }}
 
 async function unlock() {{
@@ -662,30 +697,29 @@ async function unlock() {{
   sessionStorage.setItem('corpus-pass', passphrase);
   document.getElementById('unlock').style.display = 'none';
   document.getElementById('corpus').style.display = '';
-  createPlaceholders();
-  window.addEventListener('scroll', onScroll, {{ passive: true }});
+  document.getElementById('nav').style.display = 'flex';
 
   // Handle #pN deep links
+  let targetPage = null;
   if (location.hash) {{
     const match = location.hash.match(/^#p(\\d+)$/);
-    if (match) {{
-      const targetPage = parseInt(match[1]);
-      const blob = MANIFEST.find(b => targetPage >= b.startPage && targetPage <= b.endPage);
-      if (blob) {{
-        // Scroll to estimated position first (instant, no loading jank)
-        const el = document.getElementById('blob-' + blob.id);
-        if (el) el.scrollIntoView();
-        await loadBlob(blob);
-        setTimeout(() => {{
-          const pg = document.getElementById('p' + targetPage);
-          if (pg) pg.scrollIntoView();
-        }}, 50);
-      }}
-    }}
+    if (match) targetPage = parseInt(match[1]);
+  }}
+
+  if (targetPage) {{
+    const blob = MANIFEST.find(b => targetPage >= b.startPage && targetPage <= b.endPage);
+    if (blob) await showBlob(blob.id, targetPage);
+    else await showBlob(0);
   }} else {{
-    updateWindow();
+    await showBlob(0);
   }}
 }}
+
+// Listen for hash changes (index links while already unlocked)
+window.addEventListener('hashchange', function() {{
+  var m = location.hash.match(/^#p(\\d+)$/);
+  if (m) gotoPage(parseInt(m[1]));
+}});
 
 // Auto-unlock if passphrase in sessionStorage
 (async () => {{
